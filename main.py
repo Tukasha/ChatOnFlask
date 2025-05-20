@@ -107,6 +107,10 @@ base_template = '''
   }
   #chat .message {
     margin-bottom: 10px;
+    word-wrap: break-word; /* Перенос слов */
+    overflow-wrap: break-word; /* Перенос слов */
+    white-space: pre-wrap; /* Перенос строк по пробелам и перенос длинных слов */
+    max-width: 75ch; /* Ограничение длины строки до 75 символов */
   }
   #chat .username {
     font-weight: 700;
@@ -534,4 +538,3 @@ def handle_send_message(data):
 
 if __name__ == '__main__':
     socketio.run(app, debug=True)
-
