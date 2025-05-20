@@ -1,4 +1,5 @@
-from flask import Flask, request, session, redirect, url_for, render_template_string, jsonify
+from flask import Flask, request, session, redirect, url_for, render_template_string
+from flask_socketio import SocketIO, emit
 from datetime import datetime, timedelta
 import threading
 import os
@@ -8,8 +9,10 @@ app = Flask(__name__)
 app.secret_key = os.urandom(24)
 app.permanent_session_lifetime = timedelta(hours=24)
 
-users = {}  # dict: username -> color hex string
-messages = []  # {username, text, timestamp, image(optional)}
+socketio = SocketIO(app)
+
+users = {}
+messages = []
 
 lock = threading.Lock()
 
@@ -206,7 +209,7 @@ base_template = '''
     box-shadow: 0 2px 4px rgba(0,0,0,0.3);
   }
   label#upload-label:hover {
-    background: var(--accent-hover);
+    background-color: var(--accent-hover);
     box-shadow: 0 4px 8px var(--accent-hover);
   }
   button {
@@ -222,7 +225,7 @@ base_template = '''
     box-shadow: 0 2px 4px rgba(0,0,0,0.3);
   }
   button:hover {
-    background: var(--accent-hover);
+    background-color: var(--accent-hover);
     box-shadow: 0 4px 8px var(--accent-hover);
   }
   .error {
@@ -330,7 +333,9 @@ chat_page_content = '''
   <button type="submit">Отправить</button>
 </form>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.4.1/socket.io.min.js"></script>
 <script>
+  const socket = io();
   const chatDiv = document.getElementById('chat');
   const form = document.getElementById('send-form');
   const msgInput = document.getElementById('msg-input');
@@ -350,12 +355,24 @@ chat_page_content = '''
     return d.toLocaleTimeString();
   }
 
+  // Store messages for continuous display
+  let allMessages = [];
+
   function addMessages(msgs, scrollToBottom=false) {
-    chatDiv.innerHTML = '';
     msgs.forEach(m => {
+      allMessages.push(m);
+    });
+    
+    // Limit stored messages to last 100
+    if(allMessages.length > 100){
+      allMessages = allMessages.slice(allMessages.length - 100);
+    }
+
+    chatDiv.innerHTML = '';
+    allMessages.forEach(m => {
       const msgEl = document.createElement('div');
       msgEl.className = 'message';
-      let color = usernameColors[m.username] || '#ffffff';
+      let color = m.color || '#ffffff';
       let html = '<span class="timestamp">[' + formatTime(m.timestamp) + ']</span>' +
                  '<span class="username" style="color: ' + color + ';">' + escapeHtml(m.username) + '</span>: ';
       if(m.text){
@@ -372,21 +389,18 @@ chat_page_content = '''
     }
   }
 
-  async function pollMessages(autoScroll=false) {
-    try {
-      const response = await fetch('/messages');
-      if(response.ok){
-        const data = await response.json();
-        usernameColors = data.user_colors || {};
-        addMessages(data.messages, autoScroll);
-      }
-    } catch(e) {
-      console.error('Error fetching messages', e);
-    }
-  }
+  socket.on('load_messages', (msgs) => {
+    allMessages = msgs;
+    addMessages([], true);
+  });
 
-  pollMessages(false);
-  setInterval(() => pollMessages(false), 2000);
+  socket.on('user_colors', (colors) => {
+    usernameColors = colors;
+  });
+
+  socket.on('new_message', (msg) => {
+    addMessages([msg], true);
+  });
 
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -398,41 +412,24 @@ chat_page_content = '''
       return;
     }
 
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64Data = reader.result;
+      socket.emit('send_message', {text: text, image: base64Data});
+      msgInput.value = '';
+      imgInput.value = '';
+    };
+
     if(file){
       const maxSize = 2 * 1024 * 1024;
       if(file.size > maxSize){
         alert('Размер изображения не должен превышать 2MB');
         return;
       }
-      const reader = new FileReader();
-      reader.onload = async () => {
-        const base64Data = reader.result;
-        const resp = await fetch('/send', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({text: text, image: base64Data})
-        });
-        if(resp.ok){
-          msgInput.value = '';
-          imgInput.value = '';
-          pollMessages(true); // Scroll on user message send
-        } else {
-          alert('Не удалось отправить сообщение.');
-        }
-      };
       reader.readAsDataURL(file);
     } else {
-      const resp = await fetch('/send', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({text: text})
-      });
-      if(resp.ok){
-        msgInput.value = '';
-        pollMessages(true); // Scroll on user message send
-      } else {
-        alert('Не удалось отправить сообщение.');
-      }
+      socket.emit('send_message', {text: text});
+      msgInput.value = '';
     }
   });
 </script>
@@ -475,66 +472,66 @@ def register():
                 return redirect(url_for('index'))
     return render_page(render_template_string(register_form_content, error=error), title='Регистрация')
 
-@app.route('/messages', methods=['GET'])
-def get_messages():
-    with lock:
-        last_msgs = messages[-100:]
-        result_msgs = []
-        for m in last_msgs:
-            msg = {
-                'username': m['username'],
-                'text': m['text'],
-                'timestamp': m['timestamp'].isoformat()
-            }
-            if 'image' in m:
-                msg['image'] = m['image']
-            result_msgs.append(msg)
-        user_colors = users.copy()
-    return jsonify(messages=result_msgs, user_colors=user_colors)
-
-@app.route('/send', methods=['POST'])
-def send_message():
-    if 'username' not in session:
-        return jsonify({'error': 'Not authenticated'}), 403
-    
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'Invalid message data'}), 400
-    text = data.get('text', '')
-    image_data = data.get('image', None)
-    if not isinstance(text, str):
-        return jsonify({'error': 'Invalid text data'}), 400
-    text = text.strip()
-    if len(text) > 500:
-        return jsonify({'error': 'Message length invalid'}), 400
-
-    image = None
-    if image_data:
-        if not (isinstance(image_data, str) and image_data.startswith('data:image/')):
-            return jsonify({'error': 'Invalid image data'}), 400
-        if len(image_data) > 5 * 1024 * 1024:
-            return jsonify({'error': 'Image too large'}), 400
-        image = image_data
-
-    if not text and not image:
-        return jsonify({'error': 'Message must contain text or image'}), 400
-
-    msg = {
-        'username': session['username'],
-        'text': text,
-        'timestamp': datetime.utcnow()
-    }
-    if image:
-        msg['image'] = image
-    with lock:
-        messages.append(msg)
-    return jsonify({'status': 'ok'})
-
 @app.before_request
 def make_session_permanent():
     session.permanent = True
 
-if __name__ == '__main__':
-    app.run(debug=True)
+@socketio.on('connect')
+def handle_connect():
+    with lock:
+        last_msgs = messages[-100:]
+        emit('load_messages', last_msgs)
+        emit('user_colors', users)
 
+@socketio.on('send_message')
+def handle_send_message(data):
+    if 'username' not in session:
+        emit('error', {'error': 'Not authenticated'})
+        return
+    
+    username = session['username']
+    text = data.get('text', '')
+    image_data = data.get('image', None)
+
+    if not isinstance(text, str):
+        emit('error', {'error': 'Invalid text data'})
+        return
+    text = text.strip()
+    if len(text) > 500:
+        emit('error', {'error': 'Message length invalid'})
+        return
+
+    image = None
+    if image_data:
+        if not (isinstance(image_data, str) and image_data.startswith('data:image/')):
+            emit('error', {'error': 'Invalid image data'})
+            return
+        if len(image_data) > 5 * 1024 * 1024:
+            emit('error', {'error': 'Image too large'})
+            return
+        image = image_data
+
+    if not text and not image:
+        emit('error', {'error': 'Message must contain text or image'})
+        return
+    
+    with lock:
+        if username not in users:
+            users[username] = random_color()
+        color = users[username]
+
+        msg = {
+            'username': username,
+            'text': text,
+            'timestamp': datetime.utcnow().isoformat(),
+            'color': color
+        }
+        if image:
+            msg['image'] = image
+        messages.append(msg)
+
+    emit('new_message', msg, broadcast=True)
+
+if __name__ == '__main__':
+    socketio.run(app, debug=True)
 
