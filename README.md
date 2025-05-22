@@ -30,14 +30,9 @@
         git clone https://github.com/Tukasha/ChatOnFlask.git
         cd ChatOnFlask   # Перейдите в директорию проекта
         ```
-    * Создайте виртуальное окружение (рекомендуется):
-        ```bash
-        python3 -m venv venv
-        source venv/bin/activate  # В Windows используйте: venv\Scripts\activate
-        ```
     * Установите необходимые пакеты:
         ```bash
-        pip install Flask
+        pip install -r requirements.txt
         ```
 
 3.  **Запуск приложения:**
